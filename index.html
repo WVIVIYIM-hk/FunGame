@@ -1,0 +1,1205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>粘粘世界 - 搭建塔</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.20.0/matter.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Segoe UI', sans-serif;
+      color: #eee;
+    }
+    .ui-bar {
+      display: flex;
+      gap: 1.5rem;
+      padding: 8px 16px;
+      background: rgba(0,0,0,0.4);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      font-size: 14px;
+    }
+    .ui-bar span { font-weight: 600; color: #6ee7b7; }
+    #canvas-wrap {
+      position: relative;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    }
+    #win-overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      background: rgba(0,0,0,0.6);
+      pointer-events: auto;
+    }
+    #win-overlay .win-text {
+      padding: 12px 24px;
+      border-radius: 999px;
+      background: rgba(22,163,74,0.95);
+      color: #ecfdf5;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+    #win-overlay .btn-next {
+      padding: 10px 24px;
+      border: none;
+      border-radius: 8px;
+      background: #0d9488;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #win-overlay .btn-next:hover { background: #0f766e; }
+    canvas { display: block; cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    .hint { margin-top: 8px; font-size: 12px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div class="ui-bar">
+    <div>剩余小球: <span id="remaining">0</span> / <span id="total">0</span></div>
+    <div>已连接: <span id="connected">0</span></div>
+    <div>已收集: <span id="collected">0</span> / <span id="collectTarget">0</span></div>
+    <div>结构最高: <span id="maxHeight">0</span> px</div>
+    <div id="status">拖拽小球连接到另一小球</div>
+  </div>
+  <div id="canvas-wrap">
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="win-overlay">
+      <span class="win-text">游戏成功</span>
+      <button type="button" class="btn-next" id="btnNextLevel">继续下一关</button>
+    </div>
+  </div>
+  <p class="hint">点击并拖拽小球，在另一小球附近松手即可形成连接。目标：让未点击小球爬上实线结构并越过红色虚线，被收集到空间2，达到收集目标即过关。</p>
+
+  <script>
+(function () {
+  'use strict';
+
+  // ========== 可配置参数 ==========
+  const CONFIG = {
+    TOTAL_BALLS: 25,
+    BALL_RADIUS: 12,
+    MAX_DRAG_LENGTH: 5000,
+    MAX_CONNECTION_LENGTH: 150,
+    MAX_BALLS_PER_SEGMENT: 2,
+    // 贴线爬行速度（Matter 每帧速度单位；0.167 约等于 10px/s）
+    CRAWL_SPEED_ON_SEGMENT: 0.167,
+    SEGMENT_SWITCH_HYSTERESIS: 3,
+    TOP_SEEK_BIAS: 0.18,
+    TOP_DIR_HYSTERESIS: 3,
+    NODE_UPHILL_BONUS: 0.2,
+    NODE_SWITCH_UPHILL_MULT: 1.8,
+    NODE_ENDPOINT_EPS: 0.08,
+    NODE_STALL_SPEED: 0.02,
+    NODE_STALL_FRAMES: 10,
+    SEGMENT_ATTACH_RADIUS: 30,
+    SEGMENT_DETACH_RADIUS: 38,
+    SEGMENT_THICKNESS: 8,
+    SEGMENT_NODE_OVERLAP: 14,
+    SEEK_TO_STRUCTURE_RADIUS: 220,
+    SEEK_TO_STRUCTURE_STRENGTH: 0.25,
+    SEEK_TO_STRUCTURE_FAR_FALLOFF: 0.22,
+    COLLECT_LINE_HYSTERESIS: 1,
+    MAX_CONNECTIONS_ON_RELEASE: 2,
+    TARGET_HEIGHT: 380,
+    COLLECT_TARGET: 8,
+    STABILITY_TIME: 2.5,
+    GRAVITY: 0.8,
+    STIFFNESS: 0.55,
+    DAMPING: 0.002,
+    GROUND_HEIGHT: 24,
+    WALL_WIDTH: 12,
+    BALL_DENSITY: 0.004,
+    BALL_FRICTION: 0.3,
+    BALL_RESTITUTION: 0.2,
+    JELLY_STRENGTH: 0.16,
+    JELLY_MAX_SPEED: 2.0,
+    JELLY_HORIZONTAL_BIAS: 3.0,
+  };
+
+  const CAT = { UNCONNECTED: 0x0001, SEGMENT: 0x0002, CONNECTED: 0x0004, DRAGGING: 0x0008 };
+  /** 未点击球 mask：不与已连接球碰撞，可穿过球 A 爬到其他实线 */
+  const MASK_UNCONNECTED = 0xFFFF & ~CAT.CONNECTED;
+
+  const canvas = document.getElementById('canvas');
+  const winOverlay = document.getElementById('win-overlay');
+  const overlayText = document.querySelector('#win-overlay .win-text');
+  const overlayBtn = document.getElementById('btnNextLevel');
+  const ctx = canvas.getContext('2d');
+  const cw = canvas.width;
+  const ch = canvas.height;
+  const groundY = ch - CONFIG.GROUND_HEIGHT;
+  const targetLineY = ch - CONFIG.TARGET_HEIGHT;
+
+  const { Engine, Render, Runner, Bodies, Body, Constraint, Composite, Events, Mouse, MouseConstraint } = Matter;
+
+  const engine = Engine.create();
+  engine.world.gravity.y = CONFIG.GRAVITY;
+  engine.constraintIterations = 6;
+
+  let allBalls = [];
+  let constraints = [];
+  let segmentBodies = [];
+  let connectedSet = new Set();
+  let currentBallCount = CONFIG.TOTAL_BALLS;
+  let collectedCount = 0;
+  let collectedVisuals = [];
+  let dragState = { active: false, ball: null, startX: 0, startY: 0, currentX: 0, currentY: 0 };
+  let gameOver = false;
+  let won = false;
+
+  function isConnected(body) {
+    return connectedSet.has(body);
+  }
+
+  function markConnected(a, b) {
+    connectedSet.add(a);
+    connectedSet.add(b);
+    convertConnectedBallToNode(a);
+    convertConnectedBallToNode(b);
+  }
+
+  function convertConnectedBallToNode(ball) {
+    if (!ball) return;
+    ball.collisionFilter.category = CAT.CONNECTED;
+    // 结构节点不与任何小球产生物理碰撞
+    ball.collisionFilter.mask = 0x0000;
+    ball.isSensor = true;
+    const ud = ball.userData || {};
+    ud.isStructureNode = true;
+    ud.isOnSegment = false;
+    ud.atTopSegment = null;
+    ball.userData = ud;
+  }
+
+  function getUnconnectedBalls() {
+    return allBalls.filter(b => !isConnected(b));
+  }
+
+  function collectBall(ball) {
+    if (!ball) return;
+    const idx = allBalls.indexOf(ball);
+    if (idx >= 0) allBalls.splice(idx, 1);
+    Composite.remove(engine.world, ball);
+    collectedCount += 1;
+    collectedVisuals.push({ wobblePhase: Math.random() * Math.PI * 2 });
+  }
+
+  function getStructureTop() {
+    let minY = Infinity;
+    for (const b of allBalls) {
+      if (!isConnected(b)) continue;
+      if (b.position.y < minY) minY = b.position.y;
+    }
+    if (minY === Infinity) return { minY: groundY, topSegments: [], topPoint: { x: cw / 2, y: groundY } };
+    const topBalls = new Set();
+    let sumTopX = 0;
+    let topCount = 0;
+    for (const b of allBalls) {
+      if (isConnected(b) && b.position.y <= minY + 2) {
+        topBalls.add(b);
+        sumTopX += b.position.x;
+        topCount += 1;
+      }
+    }
+    const topSegments = segmentBodies.filter(seg => {
+      const { bodyA, bodyB } = seg.userData;
+      return bodyA && bodyB && (topBalls.has(bodyA) || topBalls.has(bodyB));
+    });
+    const topPoint = { x: topCount > 0 ? (sumTopX / topCount) : (cw / 2), y: minY };
+    return { minY, topSegments, topPoint };
+  }
+
+  function getSegmentDirTowardTop(ax, ay, bx, by, topPoint, lastDir) {
+    if (!topPoint) return by < ay ? 1 : -1;
+    const da = Math.hypot(ax - topPoint.x, ay - topPoint.y);
+    const db = Math.hypot(bx - topPoint.x, by - topPoint.y);
+    const tie = CONFIG.TOP_DIR_HYSTERESIS ?? 3;
+    if (Math.abs(db - da) <= tie && (lastDir === 1 || lastDir === -1)) return lastDir;
+    if (Math.abs(db - da) > 0.001) return db < da ? 1 : -1;
+    return by < ay ? 1 : -1;
+  }
+
+  function buildStructureGraphInfo() {
+    const nodeIdByBody = new Map();
+    const nodeBodies = [];
+    for (const b of allBalls) {
+      if (!isConnected(b)) continue;
+      nodeIdByBody.set(b, nodeBodies.length);
+      nodeBodies.push(b);
+    }
+    const n = nodeBodies.length;
+    const adjacency = Array.from({ length: n }, () => []);
+    const segmentCompBySeg = new Map();
+    if (n === 0) {
+      return {
+        nodeIdByBody,
+        nodeDistToTop: [],
+        nodeCompId: [],
+        componentTopById: new Map(),
+        segmentCompBySeg,
+        globalTopPoint: { x: cw / 2, y: groundY },
+      };
+    }
+
+    for (const seg of segmentBodies) {
+      const { bodyA, bodyB } = seg.userData || {};
+      const ia = nodeIdByBody.get(bodyA);
+      const ib = nodeIdByBody.get(bodyB);
+      if (ia == null || ib == null) continue;
+      const w = Math.hypot(bodyA.position.x - bodyB.position.x, bodyA.position.y - bodyB.position.y) || 1;
+      adjacency[ia].push({ to: ib, w, seg });
+      adjacency[ib].push({ to: ia, w, seg });
+    }
+
+    const nodeCompId = Array(n).fill(-1);
+    const componentTopById = new Map();
+    const nodeDistToTop = Array(n).fill(Infinity);
+    let compId = 0;
+    for (let i = 0; i < n; i++) {
+      if (nodeCompId[i] !== -1) continue;
+      const stack = [i];
+      nodeCompId[i] = compId;
+      const compNodes = [];
+      while (stack.length) {
+        const v = stack.pop();
+        compNodes.push(v);
+        for (const e of adjacency[v]) {
+          if (nodeCompId[e.to] !== -1) continue;
+          nodeCompId[e.to] = compId;
+          stack.push(e.to);
+        }
+      }
+
+      let topNode = compNodes[0];
+      for (const v of compNodes) {
+        if (nodeBodies[v].position.y < nodeBodies[topNode].position.y) topNode = v;
+      }
+      componentTopById.set(compId, { x: nodeBodies[topNode].position.x, y: nodeBodies[topNode].position.y });
+
+      // 小规模图，使用 O(n^2) Dijkstra 即可
+      const localDist = Array(n).fill(Infinity);
+      const used = Array(n).fill(false);
+      localDist[topNode] = 0;
+      for (let step = 0; step < compNodes.length; step++) {
+        let pick = -1;
+        let best = Infinity;
+        for (const v of compNodes) {
+          if (!used[v] && localDist[v] < best) {
+            best = localDist[v];
+            pick = v;
+          }
+        }
+        if (pick === -1) break;
+        used[pick] = true;
+        for (const e of adjacency[pick]) {
+          if (nodeCompId[e.to] !== compId) continue;
+          const nd = localDist[pick] + e.w;
+          if (nd < localDist[e.to]) localDist[e.to] = nd;
+        }
+      }
+      for (const v of compNodes) nodeDistToTop[v] = localDist[v];
+      compId++;
+    }
+
+    for (const seg of segmentBodies) {
+      const { bodyA, bodyB } = seg.userData || {};
+      const ia = nodeIdByBody.get(bodyA);
+      const ib = nodeIdByBody.get(bodyB);
+      if (ia == null || ib == null) continue;
+      const ca = nodeCompId[ia];
+      const cb = nodeCompId[ib];
+      if (ca === cb) segmentCompBySeg.set(seg, ca);
+    }
+
+    let globalTopPoint = { x: cw / 2, y: groundY };
+    for (const [id, tp] of componentTopById) {
+      if (id === 0 || tp.y < globalTopPoint.y) globalTopPoint = tp;
+    }
+    return { nodeIdByBody, nodeDistToTop, nodeCompId, componentTopById, segmentCompBySeg, globalTopPoint };
+  }
+
+  function getSegmentDirTowardStructureTop(seg, bx, by, structureInfo, lastDir) {
+    const { bodyA, bodyB } = seg.userData || {};
+    if (!bodyA || !bodyB) return lastDir === 1 || lastDir === -1 ? lastDir : 1;
+    const ia = structureInfo.nodeIdByBody.get(bodyA);
+    const ib = structureInfo.nodeIdByBody.get(bodyB);
+    if (ia == null || ib == null) {
+      return getSegmentDirTowardTop(bodyA.position.x, bodyA.position.y, bodyB.position.x, bodyB.position.y, structureInfo.globalTopPoint, lastDir);
+    }
+
+    const ax = bodyA.position.x;
+    const ay = bodyA.position.y;
+    const sx = bodyB.position.x - ax;
+    const sy = bodyB.position.y - ay;
+    const segLen = Math.hypot(sx, sy) || 1;
+    const segLen2 = segLen * segLen;
+    const t = Math.max(0, Math.min(1, ((bx - ax) * sx + (by - ay) * sy) / segLen2));
+
+    // 从当前投影点分别到 A/B，再接图上的最短路，选择更短的一侧
+    const toA = t * segLen + (structureInfo.nodeDistToTop[ia] ?? Infinity);
+    const toB = (1 - t) * segLen + (structureInfo.nodeDistToTop[ib] ?? Infinity);
+    const tie = CONFIG.TOP_DIR_HYSTERESIS ?? 3;
+    if (Math.abs(toB - toA) <= tie && (lastDir === 1 || lastDir === -1)) return lastDir;
+    return toB < toA ? 1 : -1;
+  }
+
+  function countBallsOnSegment(seg, excludeBall, followRadius) {
+    const { bodyA, bodyB } = seg.userData;
+    if (!bodyA || !bodyB) return 0;
+    const ax = bodyA.position.x;
+    const ay = bodyA.position.y;
+    const sx = bodyB.position.x - ax;
+    const sy = bodyB.position.y - ay;
+    const segLen2 = sx * sx + sy * sy;
+    if (segLen2 === 0) return 0;
+    let count = 0;
+    for (const b of allBalls) {
+      if (b === excludeBall || isConnected(b)) continue;
+      if (dragState.active && dragState.ball === b) continue;
+      const ud = b.userData || {};
+      // 只统计“确实在该实线上爬行”的球，避免误计附近游走球
+      if (ud.isOnSegment && ud.followSeg === seg) {
+        count++;
+        continue;
+      }
+      const bx = b.position.x;
+      const by = b.position.y;
+      const t = Math.max(0, Math.min(1, ((bx - ax) * sx + (by - ay) * sy) / segLen2));
+      const px = ax + sx * t;
+      const py = ay + sy * t;
+      if (Math.hypot(bx - px, by - py) <= followRadius * 0.7 && ud.followSeg === seg) count++;
+    }
+    return count;
+  }
+
+  function createGround() {
+    const ground = Bodies.rectangle(cw / 2, ch - CONFIG.GROUND_HEIGHT / 2, cw + 4, CONFIG.GROUND_HEIGHT, {
+      isStatic: true,
+      render: { fillStyle: '#2d5016' },
+    });
+    Composite.add(engine.world, ground);
+    return ground;
+  }
+
+  function createWalls() {
+    const w = CONFIG.WALL_WIDTH || 12;
+    const h = ch + 20;
+    const leftWall = Bodies.rectangle(w / 2, ch / 2, w, h, {
+      isStatic: true,
+      render: { fillStyle: '#1e3a2f' },
+    });
+    const rightWall = Bodies.rectangle(cw - w / 2, ch / 2, w, h, {
+      isStatic: true,
+      render: { fillStyle: '#1e3a2f' },
+    });
+    Composite.add(engine.world, leftWall);
+    Composite.add(engine.world, rightWall);
+    return [leftWall, rightWall];
+  }
+
+  function createBalls() {
+    const count = currentBallCount;
+    const r = CONFIG.BALL_RADIUS;
+    const startY = groundY - r - 2;
+    const spacing = count > 1 ? ((cw - 40) / (count - 1)) : 0;
+    const startX = count > 1 ? 20 : (cw / 2);
+    for (let i = 0; i < count; i++) {
+      const ball = Bodies.circle(startX + i * spacing, startY, r, {
+        density: CONFIG.BALL_DENSITY,
+        friction: CONFIG.BALL_FRICTION,
+        restitution: CONFIG.BALL_RESTITUTION,
+        render: { fillStyle: '#6ee7b7' },
+        collisionFilter: { category: CAT.UNCONNECTED, mask: MASK_UNCONNECTED },
+      });
+      ball.label = 'ball';
+      ball.userData = {
+        index: i,
+        wobblePhase: Math.random() * Math.PI * 2,
+        crawlDir: Math.random() < 0.5 ? -1 : 1,
+        hasClimbedStructure: false,
+      };
+      allBalls.push(ball);
+      Composite.add(engine.world, ball);
+    }
+  }
+
+  function addSegmentBetween(a, b) {
+    const midX = (a.position.x + b.position.x) / 2;
+    const midY = (a.position.y + b.position.y) / 2;
+    const len = Math.hypot(b.position.x - a.position.x, b.position.y - a.position.y) || 1;
+    const angle = Math.atan2(b.position.y - a.position.y, b.position.x - a.position.x);
+    const segNodeOverlap = CONFIG.SEGMENT_NODE_OVERLAP ?? 14;
+    const segLen = len + segNodeOverlap * 2;
+    const segThickness = CONFIG.SEGMENT_THICKNESS ?? 8;
+    const seg = Bodies.rectangle(midX, midY, segLen, segThickness, {
+      isStatic: true,
+      angle,
+      render: { fillStyle: 'rgba(110,231,183,0.85)' },
+      collisionFilter: { category: CAT.SEGMENT, mask: CAT.UNCONNECTED },
+    });
+    seg.label = 'segment';
+    seg.userData = { bodyA: a, bodyB: b };
+    segmentBodies.push(seg);
+    Composite.add(engine.world, seg);
+    return seg;
+  }
+
+  function updateSegments() {
+    segmentBodies.forEach(seg => {
+      const { bodyA, bodyB } = seg.userData;
+      if (!bodyA || !bodyB) return;
+      const ax = bodyA.position.x, ay = bodyA.position.y;
+      const bx = bodyB.position.x, by = bodyB.position.y;
+      const midX = (ax + bx) / 2;
+      const midY = (ay + by) / 2;
+      Body.setPosition(seg, { x: midX, y: midY });
+      Body.setAngle(seg, Math.atan2(by - ay, bx - ax));
+    });
+  }
+
+  function hasConstraint(bodyA, bodyB) {
+    for (const c of constraints) {
+      const a = c.bodyA === bodyA && c.bodyB === bodyB;
+      const b = c.bodyA === bodyB && c.bodyB === bodyA;
+      if (a || b) return true;
+    }
+    return false;
+  }
+
+  function tryFormConnection(draggedBody, releaseX, releaseY) {
+    const threshold = CONFIG.MAX_CONNECTION_LENGTH;
+    const maxConnections = CONFIG.MAX_CONNECTIONS_ON_RELEASE || 2;
+    const others = allBalls.filter(b => b !== draggedBody);
+    const candidates = [];
+    for (const b of others) {
+      const ud = b.userData || {};
+      // 连接目标仅允许：未爬线的未连接球 or 结构节点
+      const isStructureNode = isConnected(b);
+      const isFreeUnconnected = !isConnected(b) && !ud.isOnSegment;
+      if (!isStructureNode && !isFreeUnconnected) continue;
+      const d = Math.hypot(b.position.x - releaseX, b.position.y - releaseY);
+      if (d <= threshold) candidates.push({ ball: b, dist: d });
+    }
+    if (candidates.length === 0) return false;
+    candidates.sort((a, b) => a.dist - b.dist);
+    const toConnect = candidates.slice(0, maxConnections);
+    const ax = releaseX, ay = releaseY;
+    const maxConnLen = CONFIG.MAX_CONNECTION_LENGTH;
+    Body.setPosition(draggedBody, { x: ax, y: ay });
+    Body.setVelocity(draggedBody, { x: 0, y: 0 });
+    for (const { ball: other } of toConnect) {
+      const lenAB = Math.hypot(other.position.x - ax, other.position.y - ay);
+      const constraintLength = Math.min(lenAB, maxConnLen);
+      const constraint = Constraint.create({
+        bodyA: draggedBody,
+        bodyB: other,
+        length: constraintLength,
+        stiffness: CONFIG.STIFFNESS,
+        damping: CONFIG.DAMPING,
+      });
+      Composite.add(engine.world, constraint);
+      constraints.push(constraint);
+      markConnected(draggedBody, other);
+      addSegmentBetween(draggedBody, other);
+    }
+    if (toConnect.length >= 2) {
+      const b = toConnect[0].ball, c = toConnect[1].ball;
+      if (!hasConstraint(b, c)) {
+        const lenBC = Math.hypot(c.position.x - b.position.x, c.position.y - b.position.y);
+        const lenBCcapped = Math.min(lenBC, CONFIG.MAX_CONNECTION_LENGTH);
+        const constraintBC = Constraint.create({
+          bodyA: b,
+          bodyB: c,
+          length: lenBCcapped,
+          stiffness: CONFIG.STIFFNESS,
+          damping: CONFIG.DAMPING,
+        });
+        Composite.add(engine.world, constraintBC);
+        constraints.push(constraintBC);
+        addSegmentBetween(b, c);
+      }
+    }
+    return true;
+  }
+
+  function getBallsWithinConnectionRange(cx, cy, excludeBall) {
+    const threshold = CONFIG.MAX_CONNECTION_LENGTH;
+    const maxCount = CONFIG.MAX_CONNECTIONS_ON_RELEASE || 2;
+    const candidates = [];
+    for (const b of allBalls) {
+      if (b === excludeBall) continue;
+      const ud = b.userData || {};
+      // 预览虚线目标同连接规则：未爬线未连接球 or 结构节点
+      const isStructureNode = isConnected(b);
+      const isFreeUnconnected = !isConnected(b) && !ud.isOnSegment;
+      if (!isStructureNode && !isFreeUnconnected) continue;
+      const d = Math.hypot(b.position.x - cx, b.position.y - cy);
+      if (d <= threshold) candidates.push({ ball: b, dist: d });
+    }
+    candidates.sort((a, b) => a.dist - b.dist);
+    return candidates.slice(0, maxCount).map(c => c.ball);
+  }
+
+  function getBodyAt(x, y) {
+    for (const b of getUnconnectedBalls()) {
+      const d = Math.hypot(b.position.x - x, b.position.y - y);
+      if (d <= CONFIG.BALL_RADIUS) return b;
+    }
+    return null;
+  }
+
+  function screenToWorld(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = cw / rect.width;
+    const scaleY = ch / rect.height;
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY,
+    };
+  }
+
+  function handleStart(clientX, clientY) {
+    if (gameOver) return;
+    const { x, y } = screenToWorld(clientX, clientY);
+    const ball = getBodyAt(x, y);
+    if (ball) {
+      dragState.active = true;
+      dragState.ball = ball;
+      // 被拖拽时恢复实体碰撞，避免保留爬线中的 sensor 状态
+      ball.isSensor = false;
+      ball.collisionFilter.mask = MASK_UNCONNECTED;
+      ball.collisionFilter.category = CAT.DRAGGING;
+      dragState.startX = ball.position.x;
+      dragState.startY = ball.position.y;
+      dragState.currentX = x;
+      dragState.currentY = y;
+    }
+  }
+
+  function handleMove(clientX, clientY) {
+    if (!dragState.active) return;
+    const wallW = CONFIG.WALL_WIDTH || 12;
+    const minX = wallW + CONFIG.BALL_RADIUS;
+    const maxX = cw - wallW - CONFIG.BALL_RADIUS;
+    const maxY = groundY - CONFIG.BALL_RADIUS;
+    let x = 0, y = 0;
+    const rect = canvas.getBoundingClientRect();
+    if (clientX >= 0 && clientY >= 0) {
+      const scaleX = cw / rect.width;
+      const scaleY = ch / rect.height;
+      x = (clientX - rect.left) * scaleX;
+      y = (clientY - rect.top) * scaleY;
+    } else {
+      x = dragState.currentX;
+      y = dragState.currentY;
+    }
+    let wx = x;
+    if (wx < minX) wx = minX;
+    if (wx > maxX) wx = maxX;
+    let wy = y;
+    if (wy > maxY) wy = maxY;
+    dragState.currentX = wx;
+    dragState.currentY = wy;
+  }
+
+  function handleEnd(clientX, clientY) {
+    if (!dragState.active) return;
+    const draggedBody = dragState.ball;
+    let wx = dragState.currentX, wy = dragState.currentY;
+    if (clientX >= 0 && clientY >= 0) {
+      const world = screenToWorld(clientX, clientY);
+      wx = world.x;
+      wy = world.y;
+    }
+    const wallW = CONFIG.WALL_WIDTH || 12;
+    const minX = wallW + CONFIG.BALL_RADIUS;
+    const maxX = cw - wallW - CONFIG.BALL_RADIUS;
+    const maxY = groundY - CONFIG.BALL_RADIUS;
+    if (wx < minX) wx = minX;
+    if (wx > maxX) wx = maxX;
+    if (wy > maxY) wy = maxY;
+    const formed = tryFormConnection(draggedBody, wx, wy);
+    if (!formed && draggedBody) {
+      Body.setPosition(draggedBody, { x: wx, y: wy });
+      Body.setVelocity(draggedBody, { x: 0, y: 0 });
+    }
+    if (formed) {
+      draggedBody.collisionFilter.category = CAT.CONNECTED;
+    } else {
+      draggedBody.collisionFilter.category = CAT.UNCONNECTED;
+      draggedBody.collisionFilter.mask = MASK_UNCONNECTED;
+    }
+    dragState.active = false;
+    dragState.ball = null;
+  }
+
+  function getMaxStructureHeight() {
+    let max = 0;
+    for (const b of allBalls) {
+      const top = b.position.y - CONFIG.BALL_RADIUS;
+      if (top > max) max = top;
+    }
+    return Math.round(max);
+  }
+
+  function getHeightFromGround() {
+    // 只统计已连接结构的最高点，拖拽中的/未连接的小球不计入
+    let minTop = Infinity;
+    for (const b of allBalls) {
+      if (!isConnected(b)) continue;
+      if (dragState.active && dragState.ball === b) continue;
+      const top = b.position.y - CONFIG.BALL_RADIUS;
+      if (top < minTop) minTop = top;
+    }
+    return minTop === Infinity ? 0 : Math.round(groundY - minTop);
+  }
+
+  function hasCollectPotential() {
+    if (collectedCount >= CONFIG.COLLECT_TARGET) return true;
+    const unconnected = getUnconnectedBalls();
+    if (unconnected.length === 0) return false;
+    // 已有结构时，只要还有未连接球就可能继续爬线并收集
+    if (connectedSet.size >= 2) return true;
+    // 没有结构时，至少还要有两个未连接球才能继续拖拽搭建
+    return unconnected.length >= 2;
+  }
+
+  function checkWinCondition() {
+    if (collectedCount >= CONFIG.COLLECT_TARGET) {
+      won = true;
+      gameOver = true;
+      try { window.parent.postMessage({ type: 'win', collected: collectedCount }, '*'); } catch (_) {}
+    }
+  }
+  // 过关看「收集达标」：未点击球爬上结构后越过虚线即被收集
+
+  function checkFailCondition() {
+    if (won || gameOver) return;
+    if (!hasCollectPotential()) {
+      gameOver = true;
+      try { window.parent.postMessage({ type: 'fail', reason: 'no_collect_potential' }, '*'); } catch (_) {}
+    }
+  }
+
+  function updateUI() {
+    const unconnected = getUnconnectedBalls();
+    document.getElementById('remaining').textContent = unconnected.length;
+    document.getElementById('total').textContent = currentBallCount;
+    document.getElementById('connected').textContent = connectedSet.size;
+    document.getElementById('collected').textContent = collectedCount;
+    document.getElementById('collectTarget').textContent = CONFIG.COLLECT_TARGET;
+    const maxH = getHeightFromGround();
+    document.getElementById('maxHeight').textContent = maxH;
+    const statusEl = document.getElementById('status');
+    if (won) {
+      statusEl.textContent = '过关！已达成收集目标。';
+      if (overlayText) overlayText.textContent = '游戏成功';
+      if (overlayBtn) overlayBtn.textContent = '继续下一关';
+      if (winOverlay) winOverlay.style.display = 'flex';
+    } else {
+      if (gameOver) {
+        statusEl.textContent = '失败：当前已无可收集潜力';
+        if (overlayText) overlayText.textContent = '游戏失败（无可收集潜力）';
+        if (overlayBtn) overlayBtn.textContent = '再来一次';
+        if (winOverlay) winOverlay.style.display = 'flex';
+      } else if (collectedCount > 0) {
+        if (winOverlay) winOverlay.style.display = 'none';
+        statusEl.textContent = '引导更多未连接球爬线越线收集 ' + collectedCount + '/' + CONFIG.COLLECT_TARGET;
+      } else {
+        if (winOverlay) winOverlay.style.display = 'none';
+        statusEl.textContent = '拖拽连线搭结构，让未连接球靠近并爬线上升后越过虚线';
+      }
+    }
+  }
+
+  let heightFromGround = 0;
+
+  function draw() {
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, cw, ch);
+
+    ctx.strokeStyle = '#2d5016';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(0, groundY);
+    ctx.lineTo(cw, groundY);
+    ctx.stroke();
+
+    const wallW = CONFIG.WALL_WIDTH || 12;
+    ctx.fillStyle = '#1e3a2f';
+    ctx.fillRect(0, 0, wallW, ch);
+    ctx.fillRect(cw - wallW, 0, wallW, ch);
+
+    ctx.strokeStyle = 'rgba(255,80,80,0.9)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(0, targetLineY);
+    ctx.lineTo(cw, targetLineY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 空间2：仅展示被收集的小球，玩家无法交互
+    const zonePad = 12;
+    const zoneW = 176;
+    const zoneH = 118;
+    const zoneX = cw - zoneW - zonePad - (CONFIG.WALL_WIDTH || 12);
+    const zoneY = zonePad + 6;
+    ctx.fillStyle = 'rgba(15,23,42,0.55)';
+    ctx.fillRect(zoneX, zoneY, zoneW, zoneH);
+    ctx.strokeStyle = 'rgba(148,163,184,0.85)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(zoneX, zoneY, zoneW, zoneH);
+    ctx.fillStyle = 'rgba(226,232,240,0.95)';
+    ctx.font = '12px Segoe UI, sans-serif';
+    ctx.fillText('空间2（收集区）', zoneX + 8, zoneY + 16);
+    ctx.fillText(collectedCount + ' / ' + CONFIG.COLLECT_TARGET, zoneX + zoneW - 52, zoneY + 16);
+
+    for (const c of constraints) {
+      const pa = c.bodyA.position;
+      const pb = c.bodyB.position;
+      ctx.strokeStyle = 'rgba(59,130,246,0.95)';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+    }
+
+    for (const seg of segmentBodies) {
+      const verts = seg.vertices;
+      ctx.fillStyle = 'rgba(147,197,253,0.78)';
+      ctx.beginPath();
+      ctx.moveTo(verts[0].x, verts[0].y);
+      for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    for (const b of allBalls) {
+      const R = CONFIG.BALL_RADIUS;
+      const x = b.position.x;
+      const y = b.position.y;
+      if (isConnected(b)) {
+        // 已连接球转为“结构节点”视觉：与实线同风格的圆形实体
+        ctx.beginPath();
+        ctx.arc(x, y, R * 0.92, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(147,197,253,0.92)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(59,130,246,0.95)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        continue;
+      }
+
+      // 未连接球保持原有胶球外观
+      ctx.beginPath();
+      ctx.arc(x, y, R, 0, Math.PI * 2);
+      ctx.fillStyle = '#6ee7b7';
+      ctx.fill();
+      ctx.strokeStyle = '#a7f3d0';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(x, y, R - 2, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(167,243,208,0.6)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      const eyeOffsetX = R * 0.4;
+      const eyeOffsetY = R * 0.35;
+      const baseEyeR = Math.max(1.5, R * 0.22);
+      const now = performance.now();
+      const ud = b.userData || {};
+      if (ud.blinkOffsetL == null) ud.blinkOffsetL = Math.random() * 3000;
+      if (ud.blinkOffsetR == null) ud.blinkOffsetR = Math.random() * 3000 + 1500;
+
+      const cycleL = 2200 + (ud.index % 5) * 250;
+      const cycleR = 2600 + ((ud.index + 3) % 5) * 230;
+      const eyeOpen = (t, offset, cycle) => {
+        const phase = ((t + offset) % cycle) / cycle;
+        if (phase < 0.9) return 1;
+        const p = (phase - 0.9) / 0.1;
+        return Math.max(0.15, 1 - Math.sin(p * Math.PI));
+      };
+      const openL = eyeOpen(now, ud.blinkOffsetL, cycleL);
+      const openR = eyeOpen(now, ud.blinkOffsetR, cycleR);
+
+      ctx.beginPath();
+      ctx.arc(x - eyeOffsetX, y - eyeOffsetY, baseEyeR * openL, 0, Math.PI * 2);
+      ctx.fillStyle = '#0f172a';
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x + eyeOffsetX, y - eyeOffsetY, baseEyeR * openR, 0, Math.PI * 2);
+      ctx.fillStyle = '#0f172a';
+      ctx.fill();
+    }
+
+    // 绘制空间2中的已收集小球（仅视觉展示）
+    const iconR = 5;
+    const cols = 12;
+    const gap = 12;
+    const startX = zoneX + 12;
+    const startY = zoneY + 30;
+    for (let i = 0; i < collectedVisuals.length; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const vx = startX + col * gap;
+      const vy = startY + row * gap;
+      if (vy > zoneY + zoneH - 8) break;
+      ctx.beginPath();
+      ctx.arc(vx, vy, iconR, 0, Math.PI * 2);
+      ctx.fillStyle = '#6ee7b7';
+      ctx.fill();
+      ctx.strokeStyle = '#a7f3d0';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    if (dragState.active && dragState.ball) {
+      const ax = dragState.currentX, ay = dragState.currentY;
+      const previewTargets = getBallsWithinConnectionRange(ax, ay, dragState.ball);
+      if (previewTargets.length > 0) {
+        ctx.strokeStyle = 'rgba(255,255,180,0.85)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 6]);
+        for (const target of previewTargets) {
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(target.position.x, target.position.y);
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+      }
+    }
+
+    heightFromGround = getHeightFromGround();
+    checkWinCondition();
+    checkFailCondition();
+    updateUI();
+  }
+
+  createGround();
+  createWalls();
+  createBalls();
+
+  function startNextLevel() {
+    const wasWon = won;
+    for (const b of allBalls) Composite.remove(engine.world, b);
+    for (const c of constraints) Composite.remove(engine.world, c);
+    for (const s of segmentBodies) Composite.remove(engine.world, s);
+    allBalls = [];
+    constraints = [];
+    segmentBodies = [];
+    connectedSet = new Set();
+    dragState = { active: false, ball: null, startX: 0, startY: 0, currentX: 0, currentY: 0 };
+    gameOver = false;
+    won = false;
+    collectedCount = 0;
+    collectedVisuals = [];
+    if (wasWon) currentBallCount = Math.max(1, currentBallCount - 1);
+    createBalls();
+    if (winOverlay) winOverlay.style.display = 'none';
+  }
+
+  document.getElementById('btnNextLevel').addEventListener('click', startNextLevel);
+
+  Events.on(engine, 'beforeUpdate', () => {
+    if (dragState.active && dragState.ball) {
+      const wallW = CONFIG.WALL_WIDTH || 12;
+      const minX = wallW + CONFIG.BALL_RADIUS;
+      const maxX = cw - wallW - CONFIG.BALL_RADIUS;
+      let x = dragState.currentX, y = dragState.currentY;
+      if (x < minX) x = minX;
+      if (x > maxX) x = maxX;
+      if (y > groundY - CONFIG.BALL_RADIUS) y = groundY - CONFIG.BALL_RADIUS;
+      Body.setPosition(dragState.ball, { x, y });
+      Body.setVelocity(dragState.ball, { x: 0, y: 0 });
+    }
+
+    // 爬线中的未连接球不受重力影响：在积分前抵消世界重力
+    const gy = (engine.world.gravity.y || 0) * (engine.world.gravity.scale || 0);
+    if (gy !== 0) {
+      for (const b of allBalls) {
+        if (isConnected(b)) continue;
+        if (dragState.active && dragState.ball === b) continue;
+        const ud = b.userData || {};
+        if (!ud.isOnSegment) continue;
+        Body.applyForce(b, b.position, { x: 0, y: -b.mass * gy });
+      }
+    }
+  });
+
+  Events.on(engine, 'afterUpdate', () => {
+    updateSegments();
+    const maxBallBottom = groundY - CONFIG.BALL_RADIUS;
+    const wallW = CONFIG.WALL_WIDTH || 12;
+    const minX = wallW + CONFIG.BALL_RADIUS;
+    const maxX = cw - wallW - CONFIG.BALL_RADIUS;
+    const jellyStrength = CONFIG.JELLY_STRENGTH ?? 0.16;
+    const jellyMaxSpeed = CONFIG.JELLY_MAX_SPEED ?? 2.0;
+    const attachRadius = CONFIG.SEGMENT_ATTACH_RADIUS ?? (CONFIG.BALL_RADIUS * 2.5);
+    const detachRadius = CONFIG.SEGMENT_DETACH_RADIUS ?? (attachRadius + 8);
+    const crawlSpeedOnSegment = CONFIG.CRAWL_SPEED_ON_SEGMENT ?? 0.12;
+    const seekRadius = CONFIG.SEEK_TO_STRUCTURE_RADIUS ?? 160;
+    const seekStrength = CONFIG.SEEK_TO_STRUCTURE_STRENGTH ?? 0.2;
+    const seekFarFalloff = CONFIG.SEEK_TO_STRUCTURE_FAR_FALLOFF ?? 0.22;
+    const topSeekBias = CONFIG.TOP_SEEK_BIAS ?? 0.18;
+    const structureInfo = buildStructureGraphInfo();
+    const topPoint = structureInfo.globalTopPoint;
+    const pendingCollected = [];
+    for (const b of allBalls) {
+      if (b.position.y > maxBallBottom) {
+        Body.setPosition(b, { x: b.position.x, y: maxBallBottom });
+        Body.setVelocity(b, { x: b.velocity.x * 0.5, y: 0 });
+      }
+      if (b.position.x < minX) Body.setPosition(b, { x: minX, y: b.position.y });
+      if (b.position.x > maxX) Body.setPosition(b, { x: maxX, y: b.position.y });
+      if (!isConnected(b) && (!dragState.active || dragState.ball !== b)) {
+        // 先保留当前速度；离线时再叠加随机游走
+        let vx = b.velocity.x;
+        let vy = b.velocity.y;
+        const ud = b.userData || {};
+
+        // 在靠近实线连接时，让球心“贴在线上”，并沿着更高的一端爬动
+        let bestSeg = null;
+        let bestDist = Infinity;
+        let bestScore = Infinity;
+        let projX = null;
+        let projY = null;
+        let nearestSegDist = Infinity;
+        let nearestSegProjX = null;
+        let nearestSegProjY = null;
+        const bx = b.position.x;
+        const by = b.position.y;
+        const switchHysteresis = CONFIG.SEGMENT_SWITCH_HYSTERESIS ?? 3;
+        const uphillBonus = CONFIG.NODE_UPHILL_BONUS ?? 0.2;
+        const uphillMultAtNode = CONFIG.NODE_SWITCH_UPHILL_MULT ?? 1.8;
+        const nodeEndpointEps = CONFIG.NODE_ENDPOINT_EPS ?? 0.08;
+        const nodeStallSpeed = CONFIG.NODE_STALL_SPEED ?? 0.02;
+        const nodeStallFramesNeed = CONFIG.NODE_STALL_FRAMES ?? 10;
+        let nearLockEndpoint = false;
+
+        const knownCompId = ud.knownStructureId;
+        let candidateSegments = segmentBodies;
+        if (knownCompId != null) {
+          const onlyKnown = segmentBodies.filter(seg => structureInfo.segmentCompBySeg.get(seg) === knownCompId);
+          if (onlyKnown.length > 0) candidateSegments = onlyKnown;
+        }
+
+        // 优先沿用当前跟随的实线，避免在连接点附近来回切线造成抽搐
+        if (ud.followSeg && segmentBodies.includes(ud.followSeg)) {
+          const lockedSeg = ud.followSeg;
+          const { bodyA, bodyB } = lockedSeg.userData || {};
+          if (bodyA && bodyB) {
+            const lax = bodyA.position.x;
+            const lay = bodyA.position.y;
+            const lcx = bodyB.position.x;
+            const lcy = bodyB.position.y;
+            const lsx = lcx - lax;
+            const lsy = lcy - lay;
+            const llen2 = lsx * lsx + lsy * lsy;
+            if (llen2 > 0) {
+              const lt = Math.max(0, Math.min(1, ((bx - lax) * lsx + (by - lay) * lsy) / llen2));
+              const lpx = lax + lsx * lt;
+              const lpy = lay + lsy * lt;
+              const ldist = Math.hypot(bx - lpx, by - lpy);
+              // 靠近端点时允许更积极地换到相邻线段，避免卡在结构节点
+              nearLockEndpoint = (lt < 0.1 || lt > 0.9);
+              if (ldist < detachRadius) {
+                const ltopDist = Math.hypot(lpx - topPoint.x, lpy - topPoint.y);
+                const lscore = ldist + ltopDist * topSeekBias;
+                bestDist = ldist;
+                bestScore = lscore;
+                bestSeg = { ax: lax, ay: lay, cx: lcx, cy: lcy, seg: lockedSeg, t: lt };
+                projX = lpx;
+                projY = lpy;
+              }
+            }
+          }
+        }
+
+        for (const seg of candidateSegments) {
+          const { bodyA, bodyB } = seg.userData;
+          if (!bodyA || !bodyB) continue;
+          const ax = bodyA.position.x;
+          const ay = bodyA.position.y;
+          const cx = bodyB.position.x;
+          const cy = bodyB.position.y;
+          const sx = cx - ax;
+          const sy = cy - ay;
+          const segLen2 = sx * sx + sy * sy;
+          if (segLen2 === 0) continue;
+          const t = Math.max(0, Math.min(1, ((bx - ax) * sx + (by - ay) * sy) / segLen2));
+          const px = ax + sx * t;
+          const py = ay + sy * t;
+          const dist = Math.hypot(bx - px, by - py);
+          if (dist < nearestSegDist) {
+            nearestSegDist = dist;
+            nearestSegProjX = px;
+            nearestSegProjY = py;
+          }
+          const topDist = Math.hypot(px - topPoint.x, py - topPoint.y);
+          // 节点处增加“向高处移动本能”：更高的候选实线获得分数加成（score 更低）
+          const segTopY = Math.min(ay, cy);
+          const climbPotential = Math.max(0, by - segTopY);
+          const nodeUphillFactor = nearLockEndpoint ? uphillMultAtNode : 1;
+          let score = dist + topDist * topSeekBias - climbPotential * uphillBonus * nodeUphillFactor;
+          // 若已在节点附近明显卡顿，给当前锁定线段附加惩罚，强制尝试切换到相邻线段脱困
+          if (nearLockEndpoint && ud.followSeg === seg && (ud.nodeStallFrames || 0) >= nodeStallFramesNeed) {
+            score += 999;
+          }
+          const canSwitch =
+            !bestSeg ||
+            (nearLockEndpoint ? (score <= bestScore) : (score + switchHysteresis < bestScore));
+          if (dist < attachRadius && canSwitch) {
+            bestDist = dist;
+            bestScore = score;
+            bestSeg = { ax, ay, cx, cy, seg, t };
+            projX = px;
+            projY = py;
+          }
+        }
+
+        // 每条实线同时最多 2 个未连接球爬行；有人离开后 count 会减少，新球即可爬上
+        const maxOnSegment = CONFIG.MAX_BALLS_PER_SEGMENT ?? 2;
+        if (bestSeg && countBallsOnSegment(bestSeg.seg, b, attachRadius) >= maxOnSegment) {
+          bestSeg = null;
+          projX = null;
+          projY = null;
+        }
+
+        if (bestSeg && projX != null && projY != null) {
+          ud.followSeg = bestSeg.seg;
+          ud.knownStructureId = structureInfo.segmentCompBySeg.get(bestSeg.seg) ?? ud.knownStructureId;
+          // 爬线中关闭球体碰撞体积，使其可丝滑经过结构节点并转移到相连实线
+          b.isSensor = true;
+          b.collisionFilter.mask = 0x0000;
+          // 贴线爬行时衰减历史速度，减少连接点附近速度叠加抖动
+          vx *= 0.6;
+          vy *= 0.45;
+          const ax = bestSeg.ax;
+          const ay = bestSeg.ay;
+          let sx = bestSeg.cx - ax;
+          let sy = bestSeg.cy - ay;
+          const segLen = Math.hypot(sx, sy);
+          if (segLen > 0) {
+            sx /= segLen;
+            sy /= segLen;
+          }
+
+          ud.isOnSegment = true;
+          ud.hasClimbedStructure = true;
+          ud.atTopSegment = null;
+          const tRaw = typeof bestSeg.t === 'number' ? bestSeg.t : 0.5;
+          // 避免球心精确落在结构节点中心，减少“节点卡住”概率
+          const safeT = Math.max(nodeEndpointEps, Math.min(1 - nodeEndpointEps, tRaw));
+          const safeProjX = ax + (bestSeg.cx - ax) * safeT;
+          const safeProjY = ay + (bestSeg.cy - ay) * safeT;
+          Body.setPosition(b, { x: safeProjX, y: safeProjY });
+          const dirToTop = getSegmentDirTowardStructureTop(bestSeg.seg, safeProjX, safeProjY, structureInfo, ud.crawlDir);
+          ud.crawlDir = dirToTop;
+          vx += sx * crawlSpeedOnSegment * dirToTop;
+          vy += sy * crawlSpeedOnSegment * dirToTop;
+          const nearNode = tRaw < nodeEndpointEps || tRaw > (1 - nodeEndpointEps);
+          const crawlSpeed = Math.hypot(vx, vy);
+          if (nearNode && crawlSpeed < nodeStallSpeed) {
+            ud.nodeStallFrames = (ud.nodeStallFrames || 0) + 1;
+          } else {
+            ud.nodeStallFrames = 0;
+          }
+        } else {
+          ud.isOnSegment = false;
+          ud.followSeg = null;
+          ud.atTopSegment = null;
+          ud.nodeStallFrames = 0;
+          // 离开实线后恢复正常碰撞
+          b.isSensor = false;
+          b.collisionFilter.mask = MASK_UNCONNECTED;
+          const bias = CONFIG.JELLY_HORIZONTAL_BIAS ?? 3.0;
+          // 离线后恢复随机游走，并主动朝最近实线靠近
+          vx += (Math.random() - 0.5) * jellyStrength * 2 * bias;
+          if (nearestSegProjX != null && nearestSegProjY != null && segmentBodies.length > 0) {
+            let tx = nearestSegProjX - bx;
+            let ty = nearestSegProjY - by;
+            const tlen = Math.hypot(tx, ty) || 1;
+            tx /= tlen;
+            ty /= tlen;
+            // 近距离强吸附，远距离保留衰减吸附，确保“会主动靠近结构”
+            const near = nearestSegDist <= seekRadius;
+            const k = near ? 1 : seekFarFalloff;
+            vx += tx * seekStrength * k;
+            vy += ty * seekStrength * k;
+          }
+        }
+
+        const speed = Math.hypot(vx, vy);
+        if (speed > jellyMaxSpeed) {
+          const k = jellyMaxSpeed / speed;
+          Body.setVelocity(b, { x: vx * k, y: vy * k });
+        } else {
+          Body.setVelocity(b, { x: vx, y: vy });
+        }
+
+        // 只有“已经爬上过结构”的未点击球，越过虚线才会被收集到空间2
+        const collectLineHysteresis = CONFIG.COLLECT_LINE_HYSTERESIS ?? 0;
+        if (ud.hasClimbedStructure && b.position.y <= (targetLineY - collectLineHysteresis) && !gameOver) {
+          pendingCollected.push(b);
+        }
+      }
+    }
+
+    if (pendingCollected.length > 0) {
+      for (const b of pendingCollected) collectBall(b);
+    }
+  });
+
+  const runner = Runner.create();
+  Runner.run(runner, engine);
+
+  function gameLoop() {
+    draw();
+    requestAnimationFrame(gameLoop);
+  }
+  requestAnimationFrame(gameLoop);
+
+  canvas.addEventListener('mousedown', e => handleStart(e.clientX, e.clientY));
+  canvas.addEventListener('mousemove', e => handleMove(e.clientX, e.clientY));
+  canvas.addEventListener('mouseup', e => handleEnd(e.clientX, e.clientY));
+  canvas.addEventListener('mouseleave', () => { if (dragState.active) handleEnd(-1, -1); });
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    if (e.touches.length) handleStart(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    if (e.touches.length) handleMove(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    if (e.changedTouches.length) handleEnd(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+  }, { passive: false });
+
+})();
+  </script>
+</body>
+</html>
